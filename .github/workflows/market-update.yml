@@ -9,13 +9,14 @@ concurrency: market-update
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install requests pandas lxml beautifulsoup4
-      - run: python scripts/update_market.py
+      - run: pip install requests beautifulsoup4 yfinance
+      - run: python -u scripts/update_market.py
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
