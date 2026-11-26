@@ -1,4 +1,4 @@
-import os, datetime as dt, requests, time, math
+import os, datetime as dt, requests, time, math, re
 from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
@@ -58,36 +58,72 @@ def us():
  if rows:put('stock_prices',rows)
  print('US symbols updated:',sum(bool(x) for x in results),'/',len(results),flush=True)
  if not all(results):raise ValueError('partial US coverage')
+def fx_row(d,b,a,source):
+ b,a=float(b),float(a)
+ if not (15<b<=a<60 and a-b<2):raise ValueError('invalid spot pair')
+ if d>str(dt.datetime.now(ZoneInfo('Asia/Taipei')).date()):raise ValueError('future quote')
+ return dict(rate_date=d,spot_buy=b,spot_sell=a,source=source)
+def spot_pair(tr):
+ # BOT uses sight (spot), not cash; desktop and mobile may duplicate cells.
+ cells=tr.select('td.rate-content-sight')
+ if len(cells)>=2:
+  return [c.get_text(strip=True) for c in cells[:2]]
+ # Historical rows can have duplicated date/currency columns. Select numeric
+ # cells only, in the published cash-buy, cash-sell, spot-buy, spot-sell order.
+ nums=[c.get_text(strip=True) for c in tr.find_all('td',recursive=False)]
+ nums=[v for v in nums if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?',v) or v=='-']
+ if len(nums)>=4:return nums[2:4]
+ raise ValueError('spot columns absent')
 def parse_fx(html):
  soup=BeautifulSoup(html,'html.parser');rows={}
- for tr in soup.select('table tbody tr'):
+ for tr in soup.select('table tr'):
   cells=tr.find_all('td',recursive=False)
   if not cells:continue
   try:
-   d=date(cells[0].get_text(strip=True))
-   # BOT historical table has date, currency, cash buy/sell, spot buy/sell.
-   # Desktop rate cells are identified by their official class, avoiding mobile duplicates.
-   ratecells=tr.select('td.rate-content-cash.text-right.print_hide, td.rate-content-sight.text-right.print_hide')
-   if len(ratecells)!=4:
-    ratecells=tr.select('td.rate-content-cash, td.rate-content-sight')
-   if len(ratecells)==4: b,a=[float(c.get_text(strip=True)) for c in ratecells[-2:]]
-   elif len(cells)==6: b,a=[float(c.get_text(strip=True)) for c in cells[4:6]]
-   else:continue
-   if not (15<b<=a<60 and a-b<2):continue
-   if d>str(dt.datetime.now(ZoneInfo('Asia/Taipei')).date()):continue
-   rows[d]=dict(rate_date=d,spot_buy=b,spot_sell=a,source='Bank of Taiwan')
+   d=date(cells[0].get_text(strip=True));b,a=spot_pair(tr)
+   rows[d]=fx_row(d,b,a,'Bank of Taiwan')
   except (ValueError,TypeError,IndexError):continue
  return list(rows.values())
+def parse_live(html):
+ soup=BeautifulSoup(html,'html.parser')
+ # Actual published timestamp, never the runner date. Use business-hours
+ # quotations only; after-hours rates are not comparable to history.
+ text=soup.get_text(' ',strip=True)
+ if '非營業時間' in text:
+  # Instructions mention both sessions, so check heading rather than body.
+  heading=' '.join(h.get_text(' ',strip=True) for h in soup.select('h1,h2,h3'))
+  if '非營業時間' in heading:raise ValueError('after-hours quote')
+ match=re.search(r'牌價最新掛牌時間\s*[：:]\s*(\d{4}/\d{1,2}/\d{1,2})\s+\d{1,2}:\d{2}',text)
+ if not match:raise ValueError('published timestamp missing')
+ d=dt.datetime.strptime(match.group(1),'%Y/%m/%d').date().isoformat()
+ for tr in soup.select('table tr'):
+  if re.search(r'\bUSD\b',tr.get_text(' ',strip=True)):
+   b,a=spot_pair(tr);return fx_row(d,b,a,'Bank of Taiwan live')
+ raise ValueError('USD row missing')
 def fx():
- rows={}
+ rows={};live=None
+ try:
+  r=fetch('https://rate.bot.com.tw/xrt',params={'Lang':'zh-TW'});r.encoding='utf-8';live=parse_live(r.text)
+  print('FX live date:',live['rate_date'],flush=True)
+ except Exception as e:print('FX live unavailable:',str(e) if isinstance(e,ValueError) else diagnostic(e),flush=True)
+ # Historical data takes precedence. Do not overwrite authoritative history
+ # with a provisional quote, even during maintenance.
+ if live:
+  existing=get('exchange_rates',{'select':'source','rate_date':'eq.'+live['rate_date']})
+  if not existing or existing[0]['source']=='Bank of Taiwan live':put('exchange_rates',[live])
  for path in ['l6m','ltm']:
   try:
    r=fetch('https://rate.bot.com.tw/xrt/quote/'+path+'/USD');r.encoding='utf-8'
-   for row in parse_fx(r.text):rows[row['rate_date']]=row
-  except Exception as e:print('FX source failed:',diagnostic(e),flush=True)
- if not rows:raise ValueError('no verified FX rows')
- put('exchange_rates',list(rows.values()))
- print('FX dates:',min(rows),'to',max(rows),'count',len(rows),flush=True)
+   parsed=parse_fx(r.text)
+   if not parsed:raise ValueError('no historical rows (maintenance or schema change)')
+   for row in parsed:rows[row['rate_date']]=row
+   print('FX history',path,'rows:',len(parsed),flush=True)
+  except Exception as e:print('FX history',path,'unavailable:',str(e) if isinstance(e,ValueError) else diagnostic(e),flush=True)
+ if rows:
+  put('exchange_rates',list(rows.values()))
+  print('FX dates:',min(rows),'to',max(rows),'count',len(rows),flush=True)
+ elif not live:raise ValueError('no verified FX rows; existing data retained')
+ else:print('FX partial: live quote only; historical gaps remain',flush=True)
 def catalog():
  import json
  from bs4 import BeautifulSoup
