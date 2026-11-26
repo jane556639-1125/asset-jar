@@ -10,7 +10,7 @@ def put(t,rows):
  for i in range(0,len(rows),300):
   r=requests.post(URL+t,headers=H,json=rows[i:i+300],timeout=45);r.raise_for_status()
 def fetch(url,**kw):
- r=requests.get(url,timeout=40,headers={'User-Agent':'Mozilla/5.0'},**kw);r.raise_for_status();return r
+ r=requests.get(url,timeout=20,headers={'User-Agent':'Mozilla/5.0'},**kw);r.raise_for_status();return r
 errors=[]
 def run(name,fn):
  try: fn();print(name,'OK')
@@ -32,32 +32,29 @@ def tw():
   put('stock_prices',[x for x in rows if x['close_price']>0])
 def us():
  import yfinance as yf
- from concurrent.futures import ThreadPoolExecutor
- tickers={'VTI','VOO','QQQ','AAPL','NVDA','MSFT','VGIT'}
+ tickers=set()
  for table in ['transactions','opening_holdings','targets']:
   offset=0
   while True:
    rows=get(table,{'select':'ticker','market':'eq.US','limit':1000,'offset':offset,'order':'id'});tickers.update(x['ticker'] for x in rows)
    if len(rows)<1000:break
    offset+=1000
- now=dt.datetime.now(ZoneInfo('America/New_York'))
- def one(t):
+ if not tickers:
+  print('US: no tracked symbols; nothing to update');return
+ now=dt.datetime.now(ZoneInfo('America/New_York')); count=0
+ for t in sorted(tickers):
   try:
-   frame=yf.Ticker(t).history(period='1mo',interval='1d',auto_adjust=False,timeout=15,raise_errors=True)
+   frame=yf.Ticker(t.replace('.','-')).history(period='5d',interval='1d',auto_adjust=False,timeout=10)
    rows=[]
-   for stamp,p in frame['Close'].items():
-    d=stamp.date();p=float(p)
-    if math.isfinite(p) and p>0 and (d<now.date() or (d==now.date() and now.hour>=17)):
-     rows.append(dict(market='US',ticker=t,price_date=str(d),close_price=p,source='Yahoo Finance'))
+   for stamp,price in frame['Close'].items():
+    d=stamp.date();price=float(price)
+    if math.isfinite(price) and price>0 and (d<now.date() or (d==now.date() and now.hour>=17)):
+     rows.append(dict(market='US',ticker=t,price_date=str(d),close_price=price,source='Yahoo Finance'))
    if not rows:raise ValueError('no completed sessions')
-   return rows
-  except Exception as e:
-   print('US symbol request failed:',diagnostic(e),flush=True);return []
- with ThreadPoolExecutor(max_workers=3) as pool: results=list(pool.map(one,sorted(tickers)))
- rows=[r for group in results for r in group]
- if rows:put('stock_prices',rows)
- print('US symbols updated:',sum(bool(x) for x in results),'/',len(results),flush=True)
- if not all(results):raise ValueError('partial US coverage')
+   put('stock_prices',rows);count+=1
+  except Exception as e:print('US symbol request failed:',diagnostic(e),flush=True)
+ print('US symbols updated:',count,'/',len(tickers),flush=True)
+ if count!=len(tickers):raise ValueError('partial US coverage')
 def fx_row(d,b,a,source):
  b,a=float(b),float(a)
  if not (15<b<=a<60 and a-b<2):raise ValueError('invalid spot pair')
@@ -74,56 +71,34 @@ def spot_pair(tr):
  nums=[v for v in nums if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?',v) or v=='-']
  if len(nums)>=4:return nums[2:4]
  raise ValueError('spot columns absent')
-def parse_fx(html):
- soup=BeautifulSoup(html,'html.parser');rows={}
- for tr in soup.select('table tr'):
-  cells=tr.find_all('td',recursive=False)
-  if not cells:continue
-  try:
-   d=date(cells[0].get_text(strip=True));b,a=spot_pair(tr)
-   rows[d]=fx_row(d,b,a,'Bank of Taiwan')
-  except (ValueError,TypeError,IndexError):continue
- return list(rows.values())
 def parse_live(html):
  soup=BeautifulSoup(html,'html.parser')
- # Actual published timestamp, never the runner date. Use business-hours
- # quotations only; after-hours rates are not comparable to history.
+ # Prefer published date near the quote label or heading; no time required.
+ candidates=[]
+ for el in soup.select('.time, .pull-left, h1, h2, h3, title, time'):
+  text=el.get_text(' ',strip=True)
+  if '牌' in text or '匯率' in text or '掛牌' in text or el.name=='time':candidates.append(text)
  text=soup.get_text(' ',strip=True)
- if '非營業時間' in text:
-  # Instructions mention both sessions, so check heading rather than body.
-  heading=' '.join(h.get_text(' ',strip=True) for h in soup.select('h1,h2,h3'))
-  if '非營業時間' in heading:raise ValueError('after-hours quote')
- match=re.search(r'牌價最新掛牌時間\s*[：:]\s*(\d{4}/\d{1,2}/\d{1,2})\s+\d{1,2}:\d{2}',text)
- if not match:raise ValueError('published timestamp missing')
- d=dt.datetime.strptime(match.group(1),'%Y/%m/%d').date().isoformat()
+ pattern=r'(20\d{2})[年/.-]\s*(\d{1,2})[月/.-]\s*(\d{1,2})'
+ match=re.search(r'(?:牌價最新掛牌時間|最新掛牌時間|掛牌時間|牌告日期|掛牌日期)\s*[：:]?\s*'+pattern,text)
+ if not match:
+  for candidate in candidates:
+   match=re.search(pattern,candidate)
+   if match:break
+ if not match:raise ValueError('published date missing')
+ d=dt.date(*map(int,match.groups())).isoformat()
  for tr in soup.select('table tr'):
   if re.search(r'\bUSD\b',tr.get_text(' ',strip=True)):
    b,a=spot_pair(tr);return fx_row(d,b,a,'Bank of Taiwan live')
  raise ValueError('USD row missing')
 def fx():
- rows={};live=None
- try:
-  r=fetch('https://rate.bot.com.tw/xrt',params={'Lang':'zh-TW'});r.encoding='utf-8';live=parse_live(r.text)
-  print('FX live date:',live['rate_date'],flush=True)
- except Exception as e:print('FX live unavailable:',str(e) if isinstance(e,ValueError) else diagnostic(e),flush=True)
- # Historical data takes precedence. Do not overwrite authoritative history
- # with a provisional quote, even during maintenance.
- if live:
-  existing=get('exchange_rates',{'select':'source','rate_date':'eq.'+live['rate_date']})
-  if not existing or existing[0]['source']=='Bank of Taiwan live':put('exchange_rates',[live])
- for path in ['l6m','ltm']:
-  try:
-   r=fetch('https://rate.bot.com.tw/xrt/quote/'+path+'/USD');r.encoding='utf-8'
-   parsed=parse_fx(r.text)
-   if not parsed:raise ValueError('no historical rows (maintenance or schema change)')
-   for row in parsed:rows[row['rate_date']]=row
-   print('FX history',path,'rows:',len(parsed),flush=True)
-  except Exception as e:print('FX history',path,'unavailable:',str(e) if isinstance(e,ValueError) else diagnostic(e),flush=True)
- if rows:
-  put('exchange_rates',list(rows.values()))
-  print('FX dates:',min(rows),'to',max(rows),'count',len(rows),flush=True)
- elif not live:raise ValueError('no verified FX rows; existing data retained')
- else:print('FX partial: live quote only; historical gaps remain',flush=True)
+ r=fetch('https://rate.bot.com.tw/xrt',params={'Lang':'zh-TW'});r.encoding='utf-8'
+ try: live=parse_live(r.text)
+ except ValueError as e:
+  print('FX parse:',str(e),'; HTTP',r.status_code,'; bytes',len(r.content),'; tables',len(BeautifulSoup(r.text,'html.parser').select('table')),flush=True);raise
+ existing=get('exchange_rates',{'select':'source','rate_date':'eq.'+live['rate_date']})
+ if not existing or existing[0]['source']=='Bank of Taiwan live':put('exchange_rates',[live])
+ print('FX live date:',live['rate_date'],'spot:',live['spot_buy'],live['spot_sell'],flush=True)
 def catalog():
  import json
  from bs4 import BeautifulSoup
@@ -139,5 +114,7 @@ def catalog():
  if len(out)<500:raise ValueError('catalog incomplete')
  with open('stock-catalog.json','w',encoding='utf8') as f:json.dump({'TW':out},f,ensure_ascii=False)
 if __name__=='__main__':
- for name,fn in [('TW',tw),('FX',fx),('US',us),('catalog',catalog)]:run(name,fn)
- if errors:raise SystemExit('Partial update: '+', '.join(errors))
+ import argparse
+ parser=argparse.ArgumentParser();parser.add_argument('task',choices=['tw','us','fx','catalog']);args=parser.parse_args()
+ run(args.task.upper(),globals()[args.task])
+ if errors:raise SystemExit(1)
