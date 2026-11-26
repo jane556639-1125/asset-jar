@@ -55,50 +55,25 @@ def us():
   except Exception as e:print('US symbol request failed:',diagnostic(e),flush=True)
  print('US symbols updated:',count,'/',len(tickers),flush=True)
  if count!=len(tickers):raise ValueError('partial US coverage')
-def fx_row(d,b,a,source):
- b,a=float(b),float(a)
- if not (15<b<=a<60 and a-b<2):raise ValueError('invalid spot pair')
- if d>str(dt.datetime.now(ZoneInfo('Asia/Taipei')).date()):raise ValueError('future quote')
- return dict(rate_date=d,spot_buy=b,spot_sell=a,source=source)
-def spot_pair(tr):
- # BOT uses sight (spot), not cash; desktop and mobile may duplicate cells.
- cells=tr.select('td.rate-content-sight')
- if len(cells)>=2:
-  return [c.get_text(strip=True) for c in cells[:2]]
- # Historical rows can have duplicated date/currency columns. Select numeric
- # cells only, in the published cash-buy, cash-sell, spot-buy, spot-sell order.
- nums=[c.get_text(strip=True) for c in tr.find_all('td',recursive=False)]
- nums=[v for v in nums if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?',v) or v=='-']
- if len(nums)>=4:return nums[2:4]
- raise ValueError('spot columns absent')
-def parse_live(html):
- soup=BeautifulSoup(html,'html.parser')
- # Prefer published date near the quote label or heading; no time required.
- candidates=[]
- for el in soup.select('.time, .pull-left, h1, h2, h3, title, time'):
-  text=el.get_text(' ',strip=True)
-  if '牌' in text or '匯率' in text or '掛牌' in text or el.name=='time':candidates.append(text)
- text=soup.get_text(' ',strip=True)
- pattern=r'(20\d{2})[年/.-]\s*(\d{1,2})[月/.-]\s*(\d{1,2})'
- match=re.search(r'(?:牌價最新掛牌時間|最新掛牌時間|掛牌時間|牌告日期|掛牌日期)\s*[：:]?\s*'+pattern,text)
- if not match:
-  for candidate in candidates:
-   match=re.search(pattern,candidate)
-   if match:break
- if not match:raise ValueError('published date missing')
- d=dt.date(*map(int,match.groups())).isoformat()
- for tr in soup.select('table tr'):
-  if re.search(r'\bUSD\b',tr.get_text(' ',strip=True)):
-   b,a=spot_pair(tr);return fx_row(d,b,a,'Bank of Taiwan live')
- raise ValueError('USD row missing')
 def fx():
- r=fetch('https://rate.bot.com.tw/xrt',params={'Lang':'zh-TW'});r.encoding='utf-8'
- try: live=parse_live(r.text)
- except ValueError as e:
-  print('FX parse:',str(e),'; HTTP',r.status_code,'; bytes',len(r.content),'; tables',len(BeautifulSoup(r.text,'html.parser').select('table')),flush=True);raise
- existing=get('exchange_rates',{'select':'source','rate_date':'eq.'+live['rate_date']})
- if not existing or existing[0]['source']=='Bank of Taiwan live':put('exchange_rates',[live])
- print('FX live date:',live['rate_date'],'spot:',live['spot_buy'],live['spot_sell'],flush=True)
+ # Reference midpoint, not actual bank bid/ask. Retain existing rates.
+ today=dt.datetime.now(ZoneInfo('Asia/Taipei')).date()
+ start=today.replace(year=today.year-5,day=min(today.day,28))
+ data=fetch('https://api.frankfurter.dev/v2/rates',params={'base':'USD','quotes':'TWD','from':start.isoformat(),'to':today.isoformat()}).json()
+ if not isinstance(data,list) or not data:raise ValueError('empty FX series')
+ rows={}
+ for item in data:
+  if item.get('base')!='USD' or item.get('quote')!='TWD':raise ValueError('unexpected FX pair')
+  d=dt.date.fromisoformat(item['date']); rate=float(item['rate'])
+  if not start<=d<=today or not math.isfinite(rate) or not 15<rate<60:raise ValueError('invalid FX observation')
+  if d.weekday()<5:
+   rows[str(d)]=dict(rate_date=str(d),spot_buy=rate,spot_sell=rate,source='Frankfurter v2 reference midpoint (not bank bid/ask)')
+ if not rows or (today-dt.date.fromisoformat(max(rows))).days>7:raise ValueError('missing recent FX observations')
+ # Ignore conflicts to preserve prior valuations and BOT records.
+ values=list(rows.values())
+ for i in range(0,len(values),300):
+  r=requests.post(URL+'exchange_rates',headers={**H,'Prefer':'resolution=ignore-duplicates,return=minimal'},json=values[i:i+300],timeout=25);r.raise_for_status()
+ print('FX series validated:',len(values),'latest:',max(rows),'mid:',rows[max(rows)]['spot_buy'],flush=True)
 def catalog():
  import json
  from bs4 import BeautifulSoup
