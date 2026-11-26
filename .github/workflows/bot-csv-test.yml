@@ -1,0 +1,47 @@
+name: BOT CSV test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: Test official CSV
+        run: |
+          python -u - <<'PY'
+          import csv, io, requests, re
+          from decimal import Decimal
+          from urllib.parse import urlsplit
+          url = 'https://rate.bot.com.tw/xrt/flcsv/0/day'
+          with requests.Session() as s:
+              s.headers.update({'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'zh-TW,zh;q=0.9'})
+              for mode in ('direct', 'session'):
+                  try:
+                      if mode == 'session':
+                          page = s.get('https://rate.bot.com.tw/xrt?Lang=zh-TW', timeout=10)
+                          print('Landing:', page.status_code, 'bytes:', len(page.content))
+                      r = s.get(url, timeout=15, headers={'Referer': 'https://rate.bot.com.tw/xrt?Lang=zh-TW'} if mode == 'session' else {})
+                      print(mode, 'HTTP', r.status_code, 'bytes', len(r.content), 'type', r.headers.get('Content-Type'), 'host', urlsplit(r.url).hostname)
+                      r.raise_for_status()
+                      rows = list(csv.reader(io.StringIO(r.content.decode('utf-8-sig'))))
+                      assert rows[0][3] == rows[0][13] == '即期', 'CSV header mismatch'
+                      row = next(x for x in rows if x and x[0] == 'USD')
+                      assert row[1] == '本行買入' and row[11] == '本行賣出'
+                      buy, sell = Decimal(row[3]), Decimal(row[13])
+                      assert 15 < buy <= sell < 60
+                      print('USD spot buy:', buy, 'sell:', sell, 'mid:', (buy+sell)/2)
+                      filename = re.search(r'ExchangeRate@(\d{12})', r.headers.get('Content-Disposition',''))
+                      print('Download filename timestamp:', filename.group(1) if filename else 'missing')
+                      print('CSV OK; no database write; quote date not independently verified')
+                      break
+                  except Exception as e:
+                      print(mode, 'failed:', type(e).__name__)
+              else:
+                  raise SystemExit('CSV unavailable or invalid')
+          PY
